@@ -31,9 +31,25 @@ scipy 1.10.1
 
 While I tried to make the code compatible with more recent releases, I cannot guarantee proper functioning or identical results with versions other than those specified.
 
+### A note on this specific fork
+
+I (Kyle) use a Mac with an M1 processor.
+Unfortunately, modern `pyscf` cannot be run on this sort of processor.
+I cannot fathom why.
+
+Anyway, the workaround is to use an *old* version of `pyscf`, but this requires an *old* version of Python, Python 3.7.
+Conspicuously, 7 < 10.
+Therefore, I modified the `pyproject.toml` file to allow Python 3.7.
+The basic example scripts still worked, so I am hoping that Mafalda's specification of Python>=3.10 is not too important.
+I'll update this note if I encounter issues later on.
+
+By the way, if you need help getting an environment with `pyscf` set up on an M1 processor, I have a tutorial script at [this repository](https://github.com/kmsherbertvt/PySCFWorkspace).
+That environment (or something similar) should be activated when running `pip install .`.
+
+
 ## Test Systems
 
-All example scripts use the $H_2$ molecule as the simplest example. All other molecules featured in the papers can be created similarly (see submodule `molecules`). 
+All example scripts use the $H_2$ molecule as the simplest example. All other molecules featured in the papers can be created similarly (see submodule `molecules`).
 
 ## Simulation Time
 
@@ -43,7 +59,7 @@ For larger molecules, such as $H_6$, simulations might take several hours to com
 
 For all options regarding the ADAPT-VQE implementation, see `AdaptVQE` class constructor in `algorithms.adaptvqe`. The current implemention supports Hessian recycling [2], TETRIS [4] and orbital optimization [7], as well as a variety of selection and convergence criteria.
 
-A variety of pool options are also supported, namely all CEO variants (OVP, MVP, DVG, DVE) [1], the qubit pool [5], the QE pool [6], and fermionic pools - GSD, SD, Spin-Adapted GSD, etc [3]. For details, see submodule `pools`. 
+A variety of pool options are also supported, namely all CEO variants (OVP, MVP, DVG, DVE) [1], the qubit pool [5], the QE pool [6], and fermionic pools - GSD, SD, Spin-Adapted GSD, etc [3]. For details, see submodule `pools`.
 
 ## References
 
