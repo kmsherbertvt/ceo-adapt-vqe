@@ -47,6 +47,7 @@ class IterationData:
         error=None,
         energy_change=None,
         gradient_norm=None,
+        prep_gradient_norm=None,
         sel_gradients=None,
         inv_hessian=None,
         gradients=None,
@@ -70,6 +71,7 @@ class IterationData:
         self.energy_change = energy_change
         self.error = error
         self.gradient_norm = gradient_norm
+        self.prep_gradient_norm = prep_gradient_norm
         self.sel_gradients = sel_gradients
         self.inv_hessian = inv_hessian
         self.gradients = gradients
@@ -97,6 +99,7 @@ class EvolutionData:
         energy,
         error,
         gradient_norm,
+        prep_gradient_norm,
         sel_gradients,
         inv_hessian,
         gradients,
@@ -121,6 +124,7 @@ class EvolutionData:
             error,
             energy_change,
             gradient_norm,
+            prep_gradient_norm,
             sel_gradients,
             inv_hessian,
             gradients,
@@ -160,6 +164,10 @@ class EvolutionData:
     @property
     def gradient_norms(self):
         return [it_data.gradient_norm for it_data in self.its_data]
+
+    @property
+    def prep_gradient_norms(self):
+        return [it_data.prep_gradient_norm for it_data in self.its_data]
 
     @property
     def indices(self):
@@ -207,27 +215,30 @@ class AdaptData:
     """
 
     def __init__(
-        self, initial_energy, pool, sparse_ref_state, file_name, fci_energy, n
+        self, initial_energy, pool, ref_det, sparse_ref_state, file_name, fci_energy, n, hamiltonian
     ):
         """
         Initialize class instance
 
         Arguments:
           initial_energy (float): energy of the reference state
-          pool (list): operator pool
+          pool (OperatorPool): operator pool
+          ref_det (list): the length n Slater determinant that will be used as the reference state
           sparse_ref_state (csc_matrix): the state to be used as the reference state (e.g. Hartree-Fock)
           file_name (str): a string describing the ADAPT implementation type and molecule
           fci_energy (float): the exact ground energy
-          n (int): the size of the system
+          n (int): the size of the system (number of qubits)
+          hamiltonian (csc_matrix): the Hamiltonian of the system
         """
 
         self.pool_name = pool.name
 
-        # The initial energy is stored apart from the remaining ones, so that the
+        # The initial energy is stored apart from the remaining ones, so that
         # the gradient norms in the beginning of an iteration are stored associated
         # with the ansatz and energy in that iteration
         self.initial_energy = initial_energy
         self.initial_error = initial_energy - fci_energy
+        self.ref_det = ref_det
         self.sparse_ref_state = sparse_ref_state
 
         self.evolution = EvolutionData(initial_energy)
@@ -235,6 +246,7 @@ class AdaptData:
         self.iteration_counter = 0
         self.fci_energy = fci_energy
         self.n = n
+        self.hamiltonian = hamiltonian
 
         self.closed = False
         self.success = False
@@ -244,6 +256,7 @@ class AdaptData:
         indices,
         energy,
         gradient_norm,
+        prep_gradient_norm,
         selected_gradients,
         coefficients,
         inv_hessian,
@@ -257,14 +270,19 @@ class AdaptData:
         class at the end of each run.
 
         Arguments:
-          operator_index (int): index of the selected operator
-          energy (float): the optimized energy, at the end of the iteration
+          indices: indices of the ansatz elements at the end of the iteration
+          energy (float): energy at the end of the iteration
           gradient_norm (int): the norm of the total gradient norm at the beggining
             of this iteration
-          selected_gradient (float): the absolute value of the gradient of the
-            operator that was added in this iteration
+          prep_gradient_norm (int): same as above, but prepending instead of appending
+          selected_gradients (float): the absolute values of the gradient of the
+            operators that were added in this iteration
           coefficients (list): a list of the coefficients selected by the optimizer
             in this iteration
+          inv_hessian (np.ndarray): the approximate inverse Hessian at the end of the
+            iteration
+          gradients (list): the gradients of the ansatz elements at the end of the
+            iteration
           nfevs (list): the number of function evaluations during the
           optimization. List length should match the number of optimizations
           ngevs (list): the number of evaluations of operator gradients during the
@@ -274,9 +292,14 @@ class AdaptData:
         if not isinstance(energy, float):
             raise TypeError("Expected float, not {}.".format(type(energy).__name__))
 
-        if not isinstance(gradient_norm, float):
+        if not isinstance(gradient_norm, (float, np.floating)):
             raise TypeError(
                 "Expected float, not {}.".format(type(gradient_norm).__name__)
+            )
+
+        if prep_gradient_norm is not None and not isinstance(prep_gradient_norm, (float, np.float64)):
+            raise TypeError(
+                "Expected float, not {}.".format(type(prep_gradient_norm).__name__)
             )
 
         if not (
@@ -318,6 +341,10 @@ class AdaptData:
             raise ValueError(
                 "Total gradient norm should be positive; its {}".format(gradient_norm)
             )
+        if prep_gradient_norm is not None and prep_gradient_norm < 0:
+            raise ValueError(
+                "Total gradient norm should be positive; its {}".format(gradient_norm)
+            )
 
         error = energy - self.fci_energy
         self.evolution.reg_it(
@@ -326,6 +353,7 @@ class AdaptData:
             energy,
             error,
             gradient_norm,
+            prep_gradient_norm,
             selected_gradients,
             inv_hessian,
             gradients,
@@ -428,6 +456,7 @@ class AdaptData:
         Arguments:
           success (bool): True if the convergence condition was met, False if not
             (the maximum number of iterations was met before that)
+          file_name (str): the final file name to assume
         """
 
         self.result = self.evolution.last_it
@@ -435,6 +464,18 @@ class AdaptData:
         self.success = success
         if file_name is not None:
             self.file_name = file_name
+
+    def delete_hessians(self, preserve_last=True):
+        """
+        Delete the inverse Hessians stored from a run of ADAPT-VQE. By default, it keeps the last one, in case a new
+        instance of ADAPT-VQE will need the data.
+
+        Arguments:
+            preserve_last (bool): if to preserve the last inverse Hessian
+        """
+
+        for it_data in self.evolution.its_data[:-preserve_last]:
+            it_data.inv_hessian = None
 
     @property
     def current(self):

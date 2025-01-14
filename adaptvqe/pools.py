@@ -439,7 +439,7 @@ class OperatorPool(metaclass=abc.ABCMeta):
         Get exponential of operator labeled by index.
         """
         if self.op_type == ImplementationType.SPARSE:
-            return expm(coefficient * self.operators[index].imp_operator)
+            return expm(coefficient * self.get_imp_op(index))
         else:
             raise ValueError
 
@@ -466,7 +466,7 @@ class OperatorPool(metaclass=abc.ABCMeta):
         assert self.op_type == ImplementationType.SPARSE
 
         if self.eig_decomp[index] is None:
-            return expm(coefficient * self.operators[index].imp_operator)
+            return expm(coefficient * self.get_imp_op(index))
         else:
             diag, unitary = self.eig_decomp[index]
             exp_diag = np.exp(coefficient * diag)
@@ -490,7 +490,7 @@ class OperatorPool(metaclass=abc.ABCMeta):
         if self.eig_decomp[index] is None:
             if not issparse(other):
                 other = csc_matrix(other)
-            return expm_multiply(coefficient * self.operators[index].imp_operator, other)
+            return expm_multiply(coefficient * self.get_imp_op(index), other)
         else:
             if issparse(other):
                 other = other.todense()
@@ -1252,7 +1252,7 @@ class PauliPool(SingletGSD):
 
         for i, (index, coefficient) in enumerate(zip(indices, coefficients)):
             qubit_operator = coefficient * self.operators[index].q_operator
-            qc = pauli_exp_circuit(qubit_operator, self.n, big_endian=True)
+            qc = pauli_exp_circuit(qubit_operator, self.n, revert_endianness=True)
 
             circuit = circuit.compose(qc)
             circuit.barrier()

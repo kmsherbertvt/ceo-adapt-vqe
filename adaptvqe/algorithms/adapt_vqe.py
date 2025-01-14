@@ -10,7 +10,7 @@ import abc
 import numpy as np
 import scipy
 
-from scipy.sparse import csc_matrix
+from scipy.sparse import csc_matrix, issparse
 from scipy.sparse.linalg import expm, expm_multiply
 
 from openfermion import get_sparse_operator, count_qubits
@@ -50,6 +50,8 @@ class AdaptVQE(metaclass=abc.ABCMeta):
         rand_degenerate=False,
         frozen_orbitals=[],
         shots=None,
+        track_prep_g=False,
+        previous_data=None
     ):
         """
         Arguments:
@@ -89,6 +91,7 @@ class AdaptVQE(metaclass=abc.ABCMeta):
                 below 10**-8). If False, the largest gradient is decided by the ">" operator.
             frozen_orbitals (list): Indices of orbitals that are considered to be permanently occupied. Note that
                 virtual orbitals are not yet implemented.
+            previous_data (AdaptData): data from a previous run of ADAPT we wish to continue
         """
 
         self.pool = pool
@@ -109,18 +112,20 @@ class AdaptVQE(metaclass=abc.ABCMeta):
         self.penalize_cnots = penalize_cnots
         self.rand_degenerate = rand_degenerate
         self.frozen_orbitals = frozen_orbitals
+        self.track_prep_g = track_prep_g
 
         # Attributes describing type of CEO pool, when applicable. The algorithm runs differently for each of them
         self.dvg = "DVG" in self.pool.name
         self.dve = "DVE" in self.pool.name
         self.mvp = "MVP" in self.pool.name
 
+        self.data = previous_data  # AdaptData object
         self.initialize_hamiltonian()  # Initialize and store Hamiltonian and initial energy
         self.create_orb_rotation_ops()  # Create list of orbital rotation operators
         self.gradients = np.array(())
         self.orb_opt_dim = len(self.orb_ops)
-        self.detail_file_name()  # Create detailed file name including all options
-        self.data = None  # Initialize attribute that will contain AdaptData object
+        if previous_data is None:
+            self.detail_file_name()  # Create detailed file name including all options
         self.energy_meas = self.observable_to_measurement(
             self.hamiltonian
         )  # Transform Hamiltonian into measurement
@@ -207,9 +212,9 @@ class AdaptVQE(metaclass=abc.ABCMeta):
         if self.frozen_orbitals != self.pool.frozen_orbitals:
             raise ValueError("Frozen orbitals must match the pool's.")
 
-        if (self.molecule is not None) + (self.custom_hamiltonian is not None) != 1:
+        if (self.molecule is not None) + (self.custom_hamiltonian is not None) + (self.data is not None) != 1:
             raise ValueError(
-                "Exactly one out of molecule / custom Hamiltonian must be specified."
+                "Exactly one out of molecule / custom Hamiltonian / previous AdaptData must be provided."
             )
 
         if not self.recycle_hessian and self.sel_criterion == "line_search":
@@ -226,8 +231,9 @@ class AdaptVQE(metaclass=abc.ABCMeta):
         """
         Initialize attributes associated with the Hamiltonian.
         """
-
-        if self.molecule is not None:
+        if self.data is not None:
+            hamiltonian = self.initialize_with_previous_data()
+        elif self.molecule is not None:
             hamiltonian = self.initialize_with_molecule()
         else:
             hamiltonian = self.initialize_with_hamiltonian()
@@ -262,6 +268,29 @@ class AdaptVQE(metaclass=abc.ABCMeta):
 
         return hamiltonian
 
+    def initialize_with_previous_data(self):
+        """
+        Initialize attributes using previous AdaptData object.
+        """
+
+        self.n = self.data.n
+
+        self.ref_det = self.data.ref_det
+        self.sparse_ref_state = self.data.sparse_ref_state
+
+        hamiltonian = self.data.hamiltonian
+
+
+        pre_it, post_it = self.data.file_name.split(str(self.data.iteration_counter) + "i")
+        self.file_name = "".join(
+            [pre_it, str(self.max_adapt_iter) + "i", post_it]
+        )
+
+        self.exact_energy = self.data.fci_energy
+        self.load(previous_data=self.data)
+
+        return hamiltonian
+
     def initialize_with_hamiltonian(self):
         """
         Initialize attributes associated with a custom Hamiltonian.
@@ -270,6 +299,7 @@ class AdaptVQE(metaclass=abc.ABCMeta):
         self.n = count_qubits(self.custom_hamiltonian.operator)
         self.file_name = f"{self.custom_hamiltonian.description}_{self.n}"
         self.sparse_ref_state = self.custom_hamiltonian.ref_state
+        self.ref_det = self.custom_hamiltonian.ref_state
         hamiltonian = self.custom_hamiltonian.operator
         self.exact_energy = self.custom_hamiltonian.ground_energy
 
@@ -288,7 +318,7 @@ class AdaptVQE(metaclass=abc.ABCMeta):
         )
 
         if self.orb_opt:
-            self.file_name += "_oo"
+            self.file_name += "_oopt"
         if not self.full_opt:
             self.file_name += "_1D"
         if self.candidates > 1:
@@ -310,16 +340,22 @@ class AdaptVQE(metaclass=abc.ABCMeta):
         """
 
         if previous_data is not None:
-            description_other = previous_data.file_name.split(
-                str(previous_data.iteration_counter) + "i"
-            )
-            description_self = self.file_name.split(str(self.max_adapt_iter) + "i")
-
-            # Description must match except iteration number
-            assert description_self == description_other
 
             self.data = deepcopy(previous_data)
             self.data.file_name = self.file_name
+
+            # Make sure we're continuing the run of ADAPT with the same settings
+            assert self.pool.name == previous_data.pool_name
+            assert bool("rec_hess" in previous_data.file_name) == self.recycle_hessian
+            assert bool("tetris" in previous_data.file_name) == self.tetris
+            assert bool("prog" in previous_data.file_name) == self.progressive_opt
+            assert bool("oopt" in previous_data.file_name) == self.orb_opt
+            assert bool("1D" in previous_data.file_name) == (not self.full_opt)
+            assert bool("pen_cnots" in  previous_data.file_name) == self.penalize_cnots
+            if self.candidates > 1:
+                assert str(self.candidates) in previous_data.file_name
+            if self.convergence_criterion != "total_g_norm":
+                assert str(self.convergence_criterion) in previous_data.file_name
 
             # Set current state to the last iteration of the loaded data
             self.indices = self.data.evolution.indices[-1]
@@ -349,13 +385,14 @@ class AdaptVQE(metaclass=abc.ABCMeta):
         Prints the options that were chosen for the Adapt VQE run.
         """
         print(f"> Pool: {self.pool.name}")
-        if self.molecule is not None:
-            print(
-                f"> Molecule: {self.molecule.description}"
-                f" (interatomic distance {self.molecule.geometry[1][1][2]}Å)"
-            )
-        else:
+        if self.custom_hamiltonian is not None:
             print(f"> Custom Hamiltonian: {self.custom_hamiltonian.description}")
+        else:
+            molecule, r = self.file_name.split("_")[:2]
+            print(
+                f"> Molecule: {molecule}"
+                f" (interatomic distance {r}Å)"
+            )
         print(f"> Orbital Optimization: {self.orb_opt}")
         print(f"> Selection method: {self.sel_criterion}")
         print(f"> Convergence criterion: {self.convergence_criterion}")
@@ -603,6 +640,73 @@ class AdaptVQE(metaclass=abc.ABCMeta):
         gradient = self.evaluate_observable(measurement, coefficients, indices)
 
         return gradient
+
+    def eval_candidate_gradient_prepending(
+        self,
+        index,
+        method="an",
+        dx=10**-8,
+        orb_params=None):
+        """
+        Estimates the gradient of unitary generated by pool operator if they are prepended to the ansatz (added
+        right after the reference state, beginning of the circuit) at point zero.
+
+        Args:
+            index (int): index of pool operator
+            method (str): the method for estimating the gradient
+            dx (float): the step size used for the finite difference approximation
+            orb_params (list): the parameters for the orbital optimization, if applicable
+
+        Returns:
+            gradient (float): the gradient
+        """
+
+        if self.data is not None:
+            coefficients = self.coefficients.copy()
+            indices = self.indices
+        else:
+            coefficients = []
+            indices = []
+
+        return self.estimate_gradient(
+            0,
+            coefficients = [0] + coefficients,
+            indices = np.concatenate(([index],indices)).astype('int'),
+            method=method,
+            dx=dx,
+            orb_params=orb_params,
+        )
+
+    def eval_candidate_gradients_prepending(
+        self,
+        method="an",
+        dx=10 ** -8,
+        orb_params=None,
+        ):
+        """
+        Estimates the gradient of unitaries generated by each pool operator if they are prepended to the ansatz (added
+        right after the reference state, beginning of the circuit) at point zero.
+
+        Args:
+            index (int): index of pool operator
+            method (str): the method for estimating the gradient
+            dx (float): the step size used for the finite difference approximation
+            orb_params (list): the parameters for the orbital optimization, if applicable
+
+        Returns:
+            gradients (list): the list of gradients, in the same order as the pool operator list
+            norm (float): the norm of the gradient
+        """
+
+        gradients = []
+        norm = 0
+
+        for index in range(self.pool.size):
+            gradient = self.eval_candidate_gradient_prepending(index, method, dx,orb_params)
+            gradients.append(gradient)
+            norm += gradient**2
+
+        return gradients, np.sqrt(norm)
 
     def estimate_gradient(
         self,
@@ -1091,9 +1195,7 @@ class AdaptVQE(metaclass=abc.ABCMeta):
         """
 
         # Screen viable candidates and calculate current total gradient norm
-        finished, viable_candidates, viable_gradients, total_norm = (
-            self.start_iteration()
-        )
+        finished, viable_candidates, viable_gradients, total_norm, prep_norm = self.start_iteration()
 
         if finished:
             # We have converged; do not complete the iteration
@@ -1112,7 +1214,7 @@ class AdaptVQE(metaclass=abc.ABCMeta):
             energy = self.optimize(g)
 
         # Save and print iteration data and update state
-        self.complete_iteration(energy, total_norm, self.iteration_sel_gradients)
+        self.complete_iteration(energy, total_norm, prep_norm, self.iteration_sel_gradients)
 
         return finished
 
@@ -1178,25 +1280,34 @@ class AdaptVQE(metaclass=abc.ABCMeta):
         Initialize data structures.
         """
 
-        initial_energy = self.evaluate_energy()
-        self.energy = initial_energy
-
         if not self.data:
+
+            initial_energy = self.evaluate_energy()
+            self.energy = initial_energy
+
             # We're starting a fresh ADAPT-VQE; create new AdaptData instance and initialize indices, coefficients
             self.data = AdaptData(
                 initial_energy,
                 self.pool,
+                self.ref_det,
                 self.sparse_ref_state,
                 self.file_name,
                 self.exact_energy,
                 self.n,
+                self.hamiltonian
             )
 
             self.indices = []
             self.coefficients = []
             self.old_coefficients = []
             self.old_gradients = []
+
         else:
+
+            self.state = self.compute_state()
+            initial_energy = self.evaluate_energy()
+            self.energy = initial_energy
+
             # Make sure the current energy is consistent with the energy of the ADAPT-VQE run we are continuing.
             # Sometimes there's a discrepancy because the PySCF Hamiltonian is not deterministic for some molecules
             # See https://github.com/pyscf/pyscf/issues/1935
@@ -1218,11 +1329,16 @@ class AdaptVQE(metaclass=abc.ABCMeta):
             self.rank_gradients()
         )
 
+        if self.track_prep_g:
+            prep_gradients, prep_norm = self.eval_candidate_gradients_prepending()
+        else:
+            prep_norm = None
+
         # Check if we've reached a termination condition
         finished = self.probe_termination(total_norm, max_norm)
 
         if finished:
-            return finished, viable_candidates, viable_gradients, total_norm
+            return finished, viable_candidates, viable_gradients, total_norm, prep_norm
 
         print(
             f"Operators under consideration ({len(viable_gradients)}):\n{viable_candidates}"
@@ -1237,7 +1353,7 @@ class AdaptVQE(metaclass=abc.ABCMeta):
             set()
         )  # Qubits acted upon by the operators selected in the current iteration
 
-        return finished, viable_candidates, viable_gradients, total_norm
+        return finished, viable_candidates, viable_gradients, total_norm, prep_norm
 
     def grow_and_update(self, viable_candidates, viable_gradients):
         """
@@ -1267,13 +1383,14 @@ class AdaptVQE(metaclass=abc.ABCMeta):
 
         return energy, gradient, viable_candidates, viable_gradients
 
-    def complete_iteration(self, energy, total_norm, sel_gradients):
+    def complete_iteration(self, energy, total_norm, prep_norm, sel_gradients):
         """
         Complete iteration by storing the relevant data and updating the state.
 
         Arguments:
             energy (float): final energy for this iteration
             total_norm (float): final gradient norm for this iteration
+            prep_norm (float): same but prepending instead of appending
             sel_gradients(list): gradients selected in this iteration
         """
 
@@ -1285,6 +1402,7 @@ class AdaptVQE(metaclass=abc.ABCMeta):
             self.indices,
             self.energy,
             total_norm,
+            prep_norm,
             sel_gradients,
             self.coefficients,
             self.inv_hessian,
@@ -2316,7 +2434,7 @@ class AdaptVQE(metaclass=abc.ABCMeta):
             # Second case: we're not recycling orbital parameters, so we must recalculate gradients
             g0 = self.estimate_gradients(initial_coefficients, indices)
             extra_njev = 1
-            
+
         # Perform optimization
         opt_result = minimize_bfgs(
             e_fun,
@@ -2389,7 +2507,7 @@ class AdaptVQE(metaclass=abc.ABCMeta):
                 e0 = self.energy
         if maxiters is None:
             maxiters = self.max_opt_iter
-            
+
         initial_coefficients = np.append(
             [0 for _ in range(self.orb_opt_dim)], initial_coefficients
         )
@@ -2593,11 +2711,12 @@ class LinAlgAdapt(AdaptVQE):
 
     def __init__(self, *args, **kvargs):
 
+        kvargs["pool"].imp_type = ImplementationType.SPARSE
+
         super().__init__(*args, **kvargs)
 
         self.state = self.sparse_ref_state
         self.ref_state = self.sparse_ref_state
-        self.pool.imp_type = ImplementationType.SPARSE
 
     def evaluate_observable(
         self,
@@ -2755,73 +2874,50 @@ class LinAlgAdapt(AdaptVQE):
 
         return generator
 
-    def estimate_gradient(
+    def eval_candidate_gradient_prepending(
         self,
-        coefficient=None,
-        operator_pos=-1,
-        coefficients=None,
-        indices=None,
-        ref_state=None,
+        index,
         method="an",
         dx=10**-8,
         orb_params=None,
     ):
         """
-        Estimates the gradient of the operator in position operator_pos of the ansatz defined by coefficients and
-        indices. Default is finite differences; child classes may define other methods.
+        Estimates the gradient of unitary generated by pool operator if they are prepended to the ansatz (added
+        right after the reference state, beginning of the circuit) at point zero.
 
         Args:
-            coefficient (float): if None we assume the coefficient is the one in the coefficient list. Else we replace
-                coefficient[operator_pos] by this value.
-            operator_pos (int): the position of the operator whose gradient we want to estimate. It may be higher than
-                the length of indices, in which case it returns the gradient of the orbital optimization parameter
-                indexed by operator_pos - len(indices).
-            coefficients (list): the coefficients of the ansatz. If not, current coefficients will be used.
-            indices (list): the indices of the ansatz. If not, current indices will be used.
-            ref_state (csc_matrix): the reference state to consider
+            index (int): index of pool operator
             method (str): the method for estimating the gradient
             dx (float): the step size used for the finite difference approximation
             orb_params (list): the parameters for the orbital optimization, if applicable
 
         Returns:
-            gradient (list): single-element list containing the approximation to the gradient
+            gradient (float): the gradient
         """
 
         if method == "fd":
             # Finite differences are implemented in parent class
-            return super().estimate_gradient(
-                operator_pos,
-                coefficients=coefficients,
-                indices=indices,
-                method=method,
-                dx=dx,
-                orb_params=orb_params,
-            )
+            return super().eval_candidate_gradient_prepending(index, method, dx, orb_params)
 
         if method != "an":
             raise ValueError(f"Method {method} is not supported.")
 
-        if coefficients is None:
+        if self.orb_opt:
+            raise NotImplementedError
+
+        if self.data is not None:
             coefficients = self.coefficients.copy()
-        if indices is None:
             indices = self.indices
-        if isinstance(coefficient, np.ndarray) or isinstance(coefficient, list):
-            assert len(coefficient) == 1
-            coefficient = coefficient[0]
+        else:
+            coefficients = []
+            indices = []
 
-        operator = self.pool.get_imp_op(indices[operator_pos])
-        if coefficient is not None:
-            coefficients[operator_pos] = coefficient
-
-        index = indices[operator_pos]
+        operator = self.pool.get_imp_op(index)
 
         left_matrix = (
-            self.compute_state(coefficients, indices, ref_state=ref_state)
+            self.compute_state(coefficients, indices)
             .transpose()
             .conj()
-        )
-        right_matrix = self.compute_state(
-            coefficients[:operator_pos], indices[:operator_pos], ref_state=ref_state
         )
 
         if self.pool.eig_decomp[index] is None:
@@ -2831,14 +2927,85 @@ class LinAlgAdapt(AdaptVQE):
             hamiltonian = self.hamiltonian.todense()
 
         left_matrix = left_matrix.dot(hamiltonian)
+        right_matrix = self.ref_state
         right_matrix = self.compute_state(
-            coefficients[operator_pos:],
-            indices[operator_pos:],
-            ref_state=operator.dot(right_matrix),
+            coefficients,
+            indices,
+            ref_state=operator.dot(right_matrix)
         )
         gradient = 2 * (left_matrix.dot(right_matrix))[0, 0].real
 
-        return [gradient]
+        return gradient
+
+    def eval_candidate_gradients_prepending(
+        self,
+        method="an",
+        dx=10**-8,
+        orb_params=None,
+    ):
+        """
+        Estimates the gradient of unitaries generated by each pool operator if they are prepended to the ansatz (added
+        right after the reference state, beginning of the circuit) at point zero.
+
+        Args:
+            index (int): index of pool operator
+            method (str): the method for estimating the gradient
+            dx (float): the step size used for the finite difference approximation
+            orb_params (list): the parameters for the orbital optimization, if applicable
+
+        Returns:
+            gradients (list): the list of gradients, in the same order as the pool operator list
+            norm (float): the norm of the gradient
+        """
+
+        if method == "fd":
+            # Finite differences are implemented in parent class
+            return super().eval_candidate_gradients_prepending(method,dx,orb_params)
+
+        if method != "an":
+            raise ValueError(f"Method {method} is not supported.")
+
+        if self.orb_opt:
+            raise NotImplementedError
+
+        if self.data is not None:
+            coefficients = self.coefficients.copy()
+            indices = self.indices
+        else:
+            coefficients = []
+            indices = []
+
+        gradients = []
+        norm = 0
+
+        left_matrix = csc_matrix(
+            self.compute_state(coefficients, indices)
+            .transpose()
+            .conj()
+        )
+
+        if self.pool.eig_decomp[0] is None:
+            hamiltonian = self.hamiltonian
+
+        else:
+            hamiltonian = csc_matrix(self.hamiltonian)#.todense()
+
+        left_matrix = left_matrix.dot(hamiltonian)
+        right_matrix = self.ref_state
+
+        for index in range(self.pool.size):
+            operator = self.pool.get_imp_op(index)
+            new_right_matrix = self.compute_state(
+                coefficients,
+                indices,
+                ref_state=operator.dot(right_matrix)
+            )
+            new_right_matrix = csc_matrix(new_right_matrix)
+            gradient = 2 * (left_matrix.dot(new_right_matrix))[0, 0].real
+            gradients.append(gradient)
+            norm += gradient**2
+
+        return gradients, np.sqrt(norm)
 
     def estimate_gradients(
         self, coefficients=None, indices=None, method="an", dx=10**-8, orb_params=None
@@ -3369,9 +3536,14 @@ class LinAlgAdapt(AdaptVQE):
         Store the provided hamiltonian as self.hamiltonian attribute after converting it to a sparse matrix.
 
         Arguments:
-            hamiltonian (InteractionOperator)
+            hamiltonian (Union[InteractionOperator,csc_matrix])
         """
-        self.hamiltonian = get_sparse_operator(hamiltonian, self.n)
+
+        if not issparse(hamiltonian):
+            hamiltonian = get_sparse_operator(hamiltonian, self.n)
+
+        self.hamiltonian = hamiltonian
+
 
     @property
     def name(self):
